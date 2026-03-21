@@ -57,25 +57,19 @@ The EMA filter prevents shorting into an uptrend and buying into a downtrend —
 ```mermaid
 flowchart TD
     A([New Bar]) --> B[Compute MACD · EMA · RSI]
-    B --> C{MACD > Signal?}
 
-    C -- Yes --> D{Close > EMA?}
-    C -- No  --> E{MACD < Signal?}
+    B --> C{"MACD > Signal\nAND Close > EMA?"}
+    B --> D{"MACD < Signal\nAND Close < EMA?"}
 
-    D -- Yes --> F{Already long?}
-    D -- No  --> Z([HOLD])
+    C -- No  --> HOLD([HOLD])
+    C -- Yes --> E{Already long?}
+    E -- Yes --> HOLD
+    E -- No  --> BUY([BUY + Stop-Loss])
 
-    E -- Yes --> G{Close < EMA?}
-    E -- No  --> Z
-
-    G -- Yes --> H{Already short?}
-    G -- No  --> Z
-
-    F -- No  --> BUY([BUY + Stop-Loss])
-    F -- Yes --> Z
-
-    H -- No  --> SELL([SELL + Stop-Loss])
-    H -- Yes --> Z
+    D -- No  --> HOLD
+    D -- Yes --> F{Already short?}
+    F -- Yes --> HOLD
+    F -- No  --> SELL([SELL + Stop-Loss])
 ```
 
 ### Configurable Strategy Modes
@@ -108,9 +102,17 @@ A stop-loss order is placed immediately after every market order fill. If dynami
 
 ```mermaid
 flowchart LR
+    K[.env] --> J[config.py]
+
     subgraph Entry["Entry Points"]
-        A["main_streaming.py\n(Primary)"]
-        B["main.py\n(Polling / Fallback)"]
+        A["main_streaming.py (Primary)"]
+        B["main.py (Polling)"]
+    end
+
+    subgraph DataLayer["Data Layer"]
+        G["data.py (REST)"]
+        H["hybrid_data.py (WebSocket)"]
+        I["data_buffer_methods.py (Buffer)"]
     end
 
     subgraph Core["Core"]
@@ -120,25 +122,18 @@ flowchart LR
         F[indicators.py]
     end
 
-    subgraph DataLayer["Data Layer"]
-        G["data.py\n(REST · Startup Backfill)"]
-        H["hybrid_data.py\n(WebSocket Stream)"]
-        I["data_buffer_methods.py\n(Rolling Buffer)"]
-    end
+    J --> Entry
+    J --> Core
+    J --> DataLayer
 
-    subgraph Cfg["Config"]
-        J[config.py]
-        K[.env]
-    end
-
-    A -->|"1. prefill buffer"| G
-    A -->|"2. start stream"| H
+    A -->|prefill| G
+    A -->|stream| H
     H --> I
     A --> C
     B --> C
-    C --> D & E
+    C --> D
+    C --> E
     D --> F
-    K --> J --> C & D & E & G & H
 ```
 
 ### Startup Sequence (Streaming Mode)
