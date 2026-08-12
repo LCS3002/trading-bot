@@ -1,5 +1,10 @@
 """
 Position sizing and ATR-based stop-loss calculation.
+
+Sizing is bounded three ways: by the risk budget (equity × RISK_PER_TRADE ÷ stop
+distance), by a notional cap (equity × MAX_POSITION_PCT), and by available buying
+power. On a tight intraday ATR the risk budget alone asks for far more shares than
+the account can responsibly hold, so the caps are what keep a position sane.
 """
 
 import logging
@@ -10,7 +15,12 @@ import pandas as pd
 import pandas_ta as ta
 from alpaca.trading.client import TradingClient
 
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, PAPER_TRADING
+from config import (
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY,
+    MAX_POSITION_PCT,
+    PAPER_TRADING,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +45,30 @@ class Risk:
         risk_per_trade: float,
         current_price: float,
         stop_loss_distance: float,
+        buying_power: Optional[float] = None,
+        max_position_pct: float = MAX_POSITION_PCT,
     ) -> int:
-        risk_amount = account_balance * risk_per_trade
-        shares = int(risk_amount / stop_loss_distance) if stop_loss_distance > 0 else 1
-        max_shares = int(account_balance / current_price)
-        return max(min(shares, max_shares), 1)
+        """Shares to trade, or 0 when the account cannot support a position."""
+        if current_price <= 0 or stop_loss_distance <= 0:
+            return 0
+
+        risk_budget = int((account_balance * risk_per_trade) / stop_loss_distance)
+        notional_cap = int((account_balance * max_position_pct) / current_price)
+
+        shares = min(risk_budget, notional_cap)
+        if buying_power is not None:
+            shares = min(shares, int(buying_power / current_price))
+
+        if shares < risk_budget:
+            logger.debug(
+                "Size capped: risk budget wanted %d shares, capped to %d "
+                "(%.0f%% notional / buying power)",
+                risk_budget,
+                shares,
+                max_position_pct * 100,
+            )
+
+        return max(shares, 0)
 
     def calculate_atr_stop(
         self, ticker_data: pd.DataFrame, atr_multiplier: float = 2.0
@@ -66,12 +95,17 @@ class Risk:
         ticker_data: pd.DataFrame,
         current_price: float,
         atr_multiplier: float = 2.0,
+        buying_power: Optional[float] = None,
     ) -> Tuple[Optional[int], Optional[float]]:
         stop_distance = self.calculate_atr_stop(ticker_data, atr_multiplier)
         if stop_distance is None:
             return None, None
         shares = self.calculate_position_size(
-            account_balance, risk_per_trade, current_price, stop_distance
+            account_balance,
+            risk_per_trade,
+            current_price,
+            stop_distance,
+            buying_power=buying_power,
         )
         return shares, stop_distance
 

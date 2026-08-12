@@ -6,9 +6,10 @@ Feeds incoming bars directly into a DataBuffer.
 import asyncio
 import logging
 
+from alpaca.data.enums import DataFeed
 from alpaca.data.live import StockDataStream
 
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, DATA_FEED
 from data_buffer_methods import DataBuffer
 
 logger = logging.getLogger(__name__)
@@ -20,7 +21,10 @@ class HybridData:
     def __init__(self, symbol: str, buffer: DataBuffer) -> None:
         self.symbol = symbol
         self.buffer = buffer
-        self.stream = StockDataStream(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        self._stopped = False
+        self.stream = StockDataStream(
+            ALPACA_API_KEY, ALPACA_SECRET_KEY, feed=DataFeed(DATA_FEED)
+        )
 
     async def _on_bar(self, bar) -> None:
         self.buffer.append_realtime(bar)
@@ -31,6 +35,9 @@ class HybridData:
         await asyncio.to_thread(self.stream.run)
 
     async def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
         await asyncio.to_thread(self.stream.stop)
         logger.info("Stream stopped for %s", self.symbol)
 

@@ -1,4 +1,7 @@
-alpaca-py
-pandas
-pandas-ta
-python-dotenv
+# Requires Python 3.12 or 3.13.
+#   pandas-ta 0.4.x needs >= 3.12, and its pinned numba (0.61.2) has no 3.14 build.
+#   Older pandas-ta releases are no longer distributed on PyPI.
+alpaca-py>=0.42,<1.0
+pandas>=2.3.2,<3.0
+pandas-ta>=0.4.71b0
+python-dotenv>=1.0

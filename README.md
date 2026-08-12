@@ -2,7 +2,7 @@
 
 An automated equity trading bot built with Python and the [Alpaca Markets API](https://alpaca.markets). Uses a real-time WebSocket bar stream as its primary data source, with a REST historical backfill at startup so it is ready to trade on the very first live bar.
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.12%20%7C%203.13-3776AB?logo=python&logoColor=white)
 ![Alpaca](https://img.shields.io/badge/Alpaca-Markets-FFCB05)
 ![Paper Trading](https://img.shields.io/badge/Default%20Mode-Paper%20Trading-28a745)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
@@ -14,8 +14,9 @@ An automated equity trading bot built with Python and the [Alpaca Markets API](h
 | Feature | Detail |
 |---|---|
 | **Strategy** | MACD crossover direction + EMA(20) trend filter |
-| **Risk model** | ATR(14)-based stop distance · 2% equity risk per trade |
-| **Stop-loss** | Placed automatically after every market order fill |
+| **Risk model** | ATR(14) stop distance · 2% equity risk · 25% notional cap per position |
+| **Stop-loss** | Placed off the confirmed fill price — position flattened if it cannot be placed |
+| **Direction** | Long and short — reverses on signal flips; set `ALLOW_SHORT=false` for long-only |
 | **Startup** | Historical backfill primes indicators — no warmup wait |
 | **Configurable** | All parameters controlled via `.env` — no code edits needed |
 
@@ -34,7 +35,9 @@ Alpaca provides two data feeds. The feed you receive depends on your subscriptio
 > **For paper trading and strategy development the free IEX feed works perfectly.**
 > Upgrade to Algo Trader Plus only when moving to live trading where execution latency matters.
 
-This bot uses the **WebSocket stream** as its live data source. Historical bars are fetched via REST at startup only to prime the indicator buffer — the minor delay on that prefetch has no impact on live signal quality.
+This bot uses the **WebSocket stream** as its live data source. Historical bars are fetched via REST at startup only to prime the indicator buffer.
+
+On a delayed feed the newest historical bar is ~15 minutes old, so the startup prefill and the first streamed bar do not meet — leaving a hole in the buffer that indicators would silently compute across. A background task re-fetches recent bars every `BACKFILL_INTERVAL` seconds and merges them in, closing that gap as the delay window rolls forward. Merges de-duplicate by timestamp, with the REST bar taking precedence over a streamed one.
 
 ---
 
@@ -67,9 +70,12 @@ flowchart TD
     E -- No  --> BUY([BUY + Stop-Loss])
 
     D -- No  --> HOLD
-    D -- Yes --> F{Already short?}
-    F -- Yes --> HOLD
-    F -- No  --> SELL([SELL + Stop-Loss])
+    D -- Yes --> F{Position?}
+    F -- Long  --> CLOSE([Close long])
+    F -- Short --> HOLD
+    F -- Flat  --> G{ALLOW_SHORT?}
+    G -- No  --> HOLD
+    G -- Yes --> SELL([SELL + Stop-Loss])
 ```
 
 ### Configurable Strategy Modes
@@ -87,14 +93,26 @@ All toggles are set in `.env` — no code changes needed.
 
 ## Risk Management
 
-Position sizes are calculated dynamically on every trade using ATR-based stops and a fixed percentage-of-equity risk model.
+Position sizes are calculated dynamically on every trade using ATR-based stops and a fixed percentage-of-equity risk model, then bounded by two hard caps.
 
 ```
 Stop Distance  =  ATR(14)  ×  ATR_MULTIPLIER
-Shares         =  (Equity  ×  RISK_PER_TRADE)  ÷  Stop Distance
+Risk Budget    =  (Equity × RISK_PER_TRADE)  ÷  Stop Distance
+Shares         =  min( Risk Budget,
+                       Equity × MAX_POSITION_PCT ÷ Price,
+                       Buying Power ÷ Price )
 ```
 
-A stop-loss order is placed immediately after every market order fill. If dynamic sizing fails (e.g. ATR unavailable), the bot falls back to 1 share with a 2% fixed stop.
+On short intraday timeframes ATR is only cents wide, so the risk budget on its own asks for far more shares than the account should hold — the notional cap is usually what binds. If sizing cannot be computed (no account info, no ATR) the trade is skipped rather than sized arbitrarily.
+
+### Stop-loss guarantee
+
+`submit_order()` returns while the order is still `pending_new`, so the fill price is not yet known. The bot therefore:
+
+1. cancels any resting orders for the symbol, so a stale stop cannot fire against the new position
+2. submits the market order and **polls it to a terminal state** (up to `ORDER_FILL_TIMEOUT`)
+3. places the stop off the **actual average fill price**, for the quantity actually filled
+4. retries once if placement fails — and flattens the position if it still fails, rather than running unprotected
 
 ---
 
@@ -150,6 +168,8 @@ sequenceDiagram
     D-->>B: prefill() — warmup marked complete
     M->>S: subscribe to live bar stream
     S-->>B: append_realtime() on each bar
+    M->>D: backfill every 60s (repairs feed-delay gap)
+    D-->>B: add_bars() — merged and de-duplicated
     B-->>E: is_ready() → True from first live bar
     E-->>E: evaluate + execute trade
 ```
@@ -182,7 +202,11 @@ cd trading-bot
 
 ### 2. Install dependencies
 
+Requires **Python 3.12 or 3.13** — `pandas-ta` 0.4.x needs ≥ 3.12, and its pinned `numba` has no 3.14 build.
+
 ```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -245,8 +269,13 @@ All settings are controlled via environment variables in `.env`:
 | `RISK_PER_TRADE` | `0.02` | Fraction of equity risked per trade (2%) |
 | `ATR_MULTIPLIER` | `2.0` | Stop-loss width in ATR(14) units |
 | `DYNAMIC_POSITION_SIZING` | `true` | ATR-based sizing vs. fixed 1 share |
+| `ALLOW_SHORT` | `true` | `true` = a SELL from flat opens a short; `false` = exit longs only |
+| `MAX_POSITION_PCT` | `0.25` | Hard cap on position notional as a fraction of equity |
+| `ORDER_FILL_TIMEOUT` | `10` | Seconds to wait for a market order to fill before giving up |
 | `LOOKBACK_MINUTES` | `300` | Historical bars fetched at startup for buffer prefill |
 | `WARMUP_BARS` | `50` | Fallback warmup bars if prefill fails |
+| `DATA_FEED` | `iex` | `iex` (free tier) or `sip` (Algo Trader Plus) |
+| `BACKFILL_INTERVAL` | `60` | Seconds between REST backfills that repair delayed-feed gaps |
 | `LOG_LEVEL` | `INFO` | `DEBUG` · `INFO` · `WARNING` · `ERROR` |
 
 ---

@@ -96,13 +96,13 @@ class Strategy:
         )
         if ticker_data is None or ticker_data.empty:
             logger.warning("No data returned for %s — holding", ticker)
-            return _HOLD
+            return dict(_HOLD)
         return self._evaluate(ticker_data)
 
     def evaluate_streaming(self, ticker_data: pd.DataFrame) -> dict:
         """Streaming path: evaluate on a pre-filled DataFrame from the buffer."""
         if ticker_data is None or ticker_data.empty:
-            return _HOLD
+            return dict(_HOLD)
         return self._evaluate(ticker_data)
 
 

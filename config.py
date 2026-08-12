@@ -32,9 +32,25 @@ RISK_PER_TRADE: float = float(os.getenv("RISK_PER_TRADE", "0.02"))
 ATR_MULTIPLIER: float = float(os.getenv("ATR_MULTIPLIER", "2.0"))
 DYNAMIC_POSITION_SIZING: bool = os.getenv("DYNAMIC_POSITION_SIZING", "true").lower() == "true"
 
+# When false a SELL signal only closes an open long — it never opens a short
+# from flat. Enabled by default: the strategy is a reversal system.
+ALLOW_SHORT: bool = os.getenv("ALLOW_SHORT", "true").lower() == "true"
+
+# Hard cap on a single position's notional value, as a fraction of equity.
+MAX_POSITION_PCT: float = float(os.getenv("MAX_POSITION_PCT", "0.25"))
+
+# Seconds to wait for a market order to fill before giving up on it.
+ORDER_FILL_TIMEOUT: float = float(os.getenv("ORDER_FILL_TIMEOUT", "10"))
+
 # ── Data settings ─────────────────────────────────────────────────────────────
 LOOKBACK_MINUTES: int = int(os.getenv("LOOKBACK_MINUTES", "300"))
 WARMUP_BARS: int = int(os.getenv("WARMUP_BARS", "50"))
+
+# "iex" (free tier) or "sip" (Algo Trader Plus). Applies to REST and the stream.
+DATA_FEED: str = os.getenv("DATA_FEED", "iex").lower()
+
+# Seconds between REST backfills that repair gaps left by delayed historical data.
+BACKFILL_INTERVAL: int = int(os.getenv("BACKFILL_INTERVAL", "60"))
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
