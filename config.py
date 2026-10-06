@@ -14,10 +14,17 @@ load_dotenv()
 ALPACA_API_KEY: str = os.getenv("API_KEY", "")
 ALPACA_SECRET_KEY: str = os.getenv("SECRET_KEY", "")
 
-if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-    raise RuntimeError(
-        "Missing Alpaca credentials. Copy .env.example → .env and fill in your keys."
-    )
+
+def require_credentials() -> None:
+    """Assert credentials are present. Called by the entry points, not at import.
+
+    Importing this module must never raise: the indicator, strategy and sizing logic
+    is pure and has to be importable — and unit-testable — without Alpaca keys.
+    """
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        raise RuntimeError(
+            "Missing Alpaca credentials. Copy .env.example → .env and fill in your keys."
+        )
 
 # ── Trading mode ──────────────────────────────────────────────────────────────
 PAPER_TRADING: bool = os.getenv("PAPER_TRADING", "true").lower() == "true"

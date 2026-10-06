@@ -9,8 +9,14 @@ Order lifecycle, in strict sequence:
     2. submit the market order
     3. poll until it reaches a terminal state — submit_order() returns while the
        order is still `pending_new`, so the fill price is not available yet
-    4. place the stop off the actual fill price; if that fails, flatten rather
+    4. place a GTC stop off the actual fill price; if that fails, flatten rather
        than hold unprotected exposure
+
+Stops are GTC rather than DAY. A DAY stop is cancelled by the broker at the close
+while the position itself survives, so an overnight hold would carry gap risk with
+nothing behind it. As a second line of defence, every HOLD on an open position
+re-checks that a correctly sized stop is actually resting, and rebuilds it off the
+broker's average entry price if it has gone missing — see `_ensure_protective_stop`.
 
 Shorting is opt-in via ALLOW_SHORT. With it off, a SELL signal only closes an
 open long — it never opens a short from flat.
@@ -22,7 +28,13 @@ from typing import Optional, Tuple
 
 import pandas as pd
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, OrderStatus, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import (
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    QueryOrderStatus,
+    TimeInForce,
+)
 from alpaca.trading.requests import (
     GetOrdersRequest,
     MarketOrderRequest,
@@ -38,13 +50,25 @@ from config import (
     ORDER_FILL_TIMEOUT,
     PAPER_TRADING,
     RISK_PER_TRADE,
+    require_credentials,
 )
 from risk import risk_instance
 from strategy import strategy_instance
 
 logger = logging.getLogger(__name__)
 
-_trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING)
+_trading_client: TradingClient | None = None
+
+
+def _get_trading_client() -> TradingClient:
+    """Built on first use, so this module imports without credentials."""
+    global _trading_client
+    if _trading_client is None:
+        require_credentials()
+        _trading_client = TradingClient(
+            ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING
+        )
+    return _trading_client
 
 _TERMINAL_STATUSES = {
     OrderStatus.FILLED,
@@ -62,7 +86,7 @@ class Execution:
     def get_current_position(self, ticker: str) -> Optional[int]:
         """Returns signed share count (negative = short, 0 = flat)."""
         try:
-            position = _trading_client.get_open_position(ticker)
+            position = _get_trading_client().get_open_position(ticker)
             return int(float(position.qty))
         except Exception as e:
             if "position does not exist" in str(e).lower():
@@ -103,7 +127,7 @@ class Execution:
     def _cancel_open_orders(self, ticker: str) -> None:
         """Clear resting orders so a stale stop cannot fire against a new position."""
         try:
-            open_orders = _trading_client.get_orders(
+            open_orders = _get_trading_client().get_orders(
                 GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[ticker])
             )
         except Exception as e:
@@ -113,7 +137,7 @@ class Execution:
         cancelled = False
         for order in open_orders:
             try:
-                _trading_client.cancel_order_by_id(order.id)
+                _get_trading_client().cancel_order_by_id(order.id)
                 cancelled = True
                 logger.info(
                     "Cancelled resting %s order | id=%s  qty=%s",
@@ -133,7 +157,7 @@ class Execution:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                still_open = _trading_client.get_orders(
+                still_open = _get_trading_client().get_orders(
                     GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[ticker])
                 )
             except Exception as e:
@@ -155,7 +179,7 @@ class Execution:
 
         while True:
             try:
-                order = _trading_client.get_order_by_id(order_id)
+                order = _get_trading_client().get_order_by_id(order_id)
             except Exception as e:
                 logger.error("Could not poll order %s: %s", order_id, e)
                 return 0, None
@@ -197,7 +221,7 @@ class Execution:
     ) -> Tuple[int, Optional[float]]:
         """Submit a market order and block until it fills or reaches a dead end."""
         try:
-            order = _trading_client.submit_order(
+            order = _get_trading_client().submit_order(
                 MarketOrderRequest(
                     symbol=ticker,
                     qty=qty,
@@ -229,13 +253,16 @@ class Execution:
     ) -> bool:
         for attempt in (1, 2):
             try:
-                _trading_client.submit_order(
+                _get_trading_client().submit_order(
                     StopOrderRequest(
                         symbol=ticker,
                         qty=shares,
                         side=side,
                         stop_price=round(stop_price, 2),
-                        time_in_force=TimeInForce.DAY,
+                        # GTC, not DAY: a DAY stop is cancelled by the broker at the
+                        # close while the position itself persists, leaving overnight
+                        # gap risk completely unhedged.
+                        time_in_force=TimeInForce.GTC,
                     )
                 )
                 logger.info(
@@ -250,6 +277,110 @@ class Execution:
                 if attempt == 1:
                     time.sleep(1)
         return False
+
+    # ── Stop re-assertion ─────────────────────────────────────────────────────
+
+    def _resting_stops(self, ticker: str, side: OrderSide) -> Optional[list]:
+        """Resting stop orders for this symbol on `side`.
+
+        `None` means "could not determine" — deliberately distinct from an empty list,
+        so a failed lookup never gets mistaken for "no stop exists" and stacks a
+        duplicate on top of a live one.
+        """
+        try:
+            orders = _get_trading_client().get_orders(
+                GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[ticker])
+            )
+        except Exception as e:
+            logger.error("Could not list open orders for %s: %s", ticker, e)
+            return None
+        return [o for o in orders if o.side == side and o.type == OrderType.STOP]
+
+    def _entry_price(self, ticker: str) -> Optional[float]:
+        """The broker's average entry price — the only reliable basis for a stop that
+        has to be rebuilt after the original order is gone."""
+        try:
+            position = _get_trading_client().get_open_position(ticker)
+            return float(position.avg_entry_price)
+        except Exception as e:
+            logger.error("Could not read entry price for %s: %s", ticker, e)
+            return None
+
+    def _ensure_protective_stop(
+        self, ticker: str, position: int, ticker_data: pd.DataFrame
+    ) -> None:
+        """Re-assert the stop when an open position is unprotected or mis-sized.
+
+        Stops are GTC, but they can still go missing — cancelled out of band, or left
+        sized for a position that has since changed. HOLD is the only branch that sees
+        an untouched open position, so this is where the check belongs.
+        """
+        is_long = position > 0
+        stop_side = OrderSide.SELL if is_long else OrderSide.BUY
+
+        resting = self._resting_stops(ticker, stop_side)
+        if resting is None:
+            return
+
+        needed = abs(position)
+        covered = 0
+        for order in resting:
+            try:
+                covered += int(float(order.qty))
+            except (TypeError, ValueError):
+                continue
+
+        if covered == needed:
+            return
+
+        logger.warning(
+            "%s is protected for %d of %d shares — re-asserting stop",
+            ticker,
+            covered,
+            needed,
+        )
+
+        stop_distance = risk_instance.calculate_atr_stop(ticker_data, ATR_MULTIPLIER)
+        entry_price = self._entry_price(ticker)
+        if stop_distance is None or entry_price is None:
+            logger.error(
+                "Cannot rebuild a stop for %s (entry=%s, ATR stop=%s) — leaving the "
+                "position as it is rather than guessing a level",
+                ticker,
+                entry_price,
+                stop_distance,
+            )
+            return
+
+        stop_price = (
+            entry_price - stop_distance if is_long else entry_price + stop_distance
+        )
+        current_price = float(ticker_data["close"].iloc[-1])
+
+        # Price already through the level the stop would have fired at: placing it now
+        # is pointless, and the broker rejects a stop on the wrong side of the market.
+        if (is_long and current_price <= stop_price) or (
+            not is_long and current_price >= stop_price
+        ):
+            logger.warning(
+                "%s is already through its stop level (price $%.2f vs stop $%.2f) "
+                "— flattening instead",
+                ticker,
+                current_price,
+                stop_price,
+            )
+            self._flatten(ticker, position, "stop level already breached")
+            return
+
+        for order in resting:
+            try:
+                _get_trading_client().cancel_order_by_id(order.id)
+            except Exception as e:
+                logger.warning("Could not cancel mis-sized stop %s: %s", order.id, e)
+        if resting:
+            self._await_cancellation(ticker)
+
+        self._place_stop(ticker, needed, stop_side, stop_price)
 
     # ── Position transitions ──────────────────────────────────────────────────
 
@@ -337,6 +468,9 @@ class Execution:
             logger.info(
                 "HOLD | ticker=%s  position=%d  signal=%s", ticker, position, decision
             )
+            # Holding is not the same as being protected — verify, don't assume.
+            if position != 0:
+                self._ensure_protective_stop(ticker, position, ticker_data)
 
         return evaluation
 

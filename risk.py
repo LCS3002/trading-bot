@@ -12,25 +12,39 @@ import math
 from typing import Optional, Tuple
 
 import pandas as pd
-import pandas_ta as ta
 from alpaca.trading.client import TradingClient
+
+from indicators import indicators_instance
 
 from config import (
     ALPACA_API_KEY,
     ALPACA_SECRET_KEY,
     MAX_POSITION_PCT,
     PAPER_TRADING,
+    require_credentials,
 )
 
 logger = logging.getLogger(__name__)
 
-_trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING)
+_trading_client: TradingClient | None = None
+
+
+def _get_trading_client() -> TradingClient:
+    """Built on first use. Only `get_account_info` needs it — the sizing and stop
+    maths below are pure, and must import and unit-test without credentials."""
+    global _trading_client
+    if _trading_client is None:
+        require_credentials()
+        _trading_client = TradingClient(
+            ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING
+        )
+    return _trading_client
 
 
 class Risk:
     def get_account_info(self) -> Optional[dict]:
         try:
-            account = _trading_client.get_account()
+            account = _get_trading_client().get_account()
             return {
                 "balance": float(account.equity),
                 "buying_power": float(account.buying_power),
@@ -76,10 +90,8 @@ class Risk:
         if ticker_data is None or ticker_data.empty or len(ticker_data) < 20:
             return None
 
-        atr = ta.atr(
-            ticker_data["high"], ticker_data["low"], ticker_data["close"], length=14
-        )
-        if atr is None or atr.empty:
+        atr = indicators_instance.get_atr(ticker_data, length=14)["ATR"]
+        if atr.empty:
             return None
 
         val = float(atr.iloc[-1])

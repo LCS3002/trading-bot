@@ -15,11 +15,20 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, DATA_FEED
+from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, DATA_FEED, require_credentials
 
 logger = logging.getLogger(__name__)
 
-_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+_client: StockHistoricalDataClient | None = None
+
+
+def _get_client() -> StockHistoricalDataClient:
+    """Built on first use, so `normalise_bars` can be imported without credentials."""
+    global _client
+    if _client is None:
+        require_credentials()
+        _client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    return _client
 
 BAR_COLUMNS = ["open", "high", "low", "close", "volume"]
 
@@ -47,8 +56,9 @@ def normalise_bars(df: pd.DataFrame) -> pd.DataFrame:
 
 
 class StockData:
-    def __init__(self) -> None:
-        self.client = _client
+    @property
+    def client(self) -> StockHistoricalDataClient:
+        return _get_client()
 
     def fetch_bars(
         self, ticker: str, timeframe: TimeFrame, lookback_minutes: int

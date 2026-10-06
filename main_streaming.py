@@ -20,13 +20,14 @@ import time
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 
-import config  # noqa: F401 — initialises logging and validates credentials
+import config  # noqa: F401 — initialises logging
 from config import (
     ALPACA_API_KEY,
     ALPACA_SECRET_KEY,
     BACKFILL_INTERVAL,
     LOOKBACK_MINUTES,
     PAPER_TRADING,
+    require_credentials,
 )
 from data import stock_data_instance
 from data_buffer_methods import data_buffer
@@ -34,6 +35,10 @@ from execution import execution_instance
 from hybrid_data import HybridData, run_stream
 
 logger = logging.getLogger(__name__)
+
+# Entry points validate credentials; importing config no longer does, so that the
+# pure signal and sizing logic stays importable (and testable) without keys.
+require_credentials()
 
 _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING)
 
