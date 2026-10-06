@@ -15,6 +15,11 @@ env/
 .venv/
 ENV/
 
+# Test artefacts
+.pytest_cache/
+.coverage
+htmlcov/
+
 # Distribution / packaging
 dist/
 build/

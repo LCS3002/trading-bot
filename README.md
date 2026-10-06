@@ -2,7 +2,8 @@
 
 An automated equity trading bot built with Python and the [Alpaca Markets API](https://alpaca.markets). Uses a real-time WebSocket bar stream as its primary data source, with a REST historical backfill at startup so it is ready to trade on the very first live bar.
 
-![Python](https://img.shields.io/badge/Python-3.12%20%7C%203.13-3776AB?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-89%20passing-28a745)
 ![Alpaca](https://img.shields.io/badge/Alpaca-Markets-FFCB05)
 ![Paper Trading](https://img.shields.io/badge/Default%20Mode-Paper%20Trading-28a745)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
@@ -15,7 +16,7 @@ An automated equity trading bot built with Python and the [Alpaca Markets API](h
 |---|---|
 | **Strategy** | MACD crossover direction + EMA(20) trend filter |
 | **Risk model** | ATR(14) stop distance · 2% equity risk · 25% notional cap per position |
-| **Stop-loss** | Placed off the confirmed fill price — position flattened if it cannot be placed |
+| **Stop-loss** | **GTC** stop off the confirmed fill price · re-checked on every HOLD · position flattened if it cannot be placed |
 | **Direction** | Long and short — reverses on signal flips; set `ALLOW_SHORT=false` for long-only |
 | **Startup** | Historical backfill primes indicators — no warmup wait |
 | **Configurable** | All parameters controlled via `.env` — no code edits needed |
@@ -84,10 +85,17 @@ All toggles are set in `.env` — no code changes needed.
 
 | `USE_MACD` | `USE_RSI` | `USE_EMA_FILTER` | Behaviour |
 |:---:|:---:|:---:|---|
-| ✅ | ❌ | ✅ | **Default** — MACD direction + EMA trend filter |
-| ✅ | ✅ | ✅ | Conservative — MACD and RSI must agree + trend filter |
-| ❌ | ✅ | ✅ | RSI oversold/overbought + trend filter |
-| ✅ | ❌ | ❌ | Raw MACD crossover (no trend filter) |
+| ✅ | ❌ | ✅ | **Default** — MACD direction + EMA(20) trend filter |
+| ✅ | ✅ | ✅ | MACD sets direction; RSI **vetoes** entry above 70 / below 30 |
+| ❌ | ✅ | — | Pure RSI mean reversion at 30 / 70 — trend filter not applied |
+| ✅ | ❌ | ❌ | Raw MACD crossover, long and short, no trend filter |
+
+> **On combining RSI with a trend filter.** RSI mean reversion and an EMA trend filter
+> pull in opposite directions: requiring `RSI < 30` *and* `close > EMA(20)` demands an
+> oversold reading inside an uptrend, which is close to unsatisfiable. Earlier versions
+> required exactly that, so the RSI modes almost never fired. RSI now acts as a veto
+> alongside MACD rather than a second condition that must agree, and in RSI-only mode
+> the trend filter is deliberately not applied.
 
 ---
 
@@ -105,14 +113,24 @@ Shares         =  min( Risk Budget,
 
 On short intraday timeframes ATR is only cents wide, so the risk budget on its own asks for far more shares than the account should hold — the notional cap is usually what binds. If sizing cannot be computed (no account info, no ATR) the trade is skipped rather than sized arbitrarily.
 
-### Stop-loss guarantee
+### Stop-loss handling
 
 `submit_order()` returns while the order is still `pending_new`, so the fill price is not yet known. The bot therefore:
 
 1. cancels any resting orders for the symbol, so a stale stop cannot fire against the new position
 2. submits the market order and **polls it to a terminal state** (up to `ORDER_FILL_TIMEOUT`)
-3. places the stop off the **actual average fill price**, for the quantity actually filled
+3. places a **GTC** stop off the **actual average fill price**, for the quantity actually filled
 4. retries once if placement fails — and flattens the position if it still fails, rather than running unprotected
+
+#### Why the stop is GTC
+
+A `DAY` stop is cancelled by the broker at the close, while the position itself survives into the next session. Earlier versions of this bot used `DAY`, which meant any position held overnight carried gap risk with nothing behind it — and because a `HOLD` decision took no action, the position could stay unprotected indefinitely.
+
+Stops are now `GTC`, and as a second line of defence **every `HOLD` on an open position verifies that a correctly sized stop is actually resting**, rebuilding it off the broker's average entry price if it has gone missing or no longer matches the position size. If price has already moved through the level the stop would have fired at, the position is flattened instead — a stop on the wrong side of the market would simply be rejected.
+
+#### What is still not guaranteed
+
+A stop is not a floor. It becomes a market order when triggered, so a gap through the level fills below it, and the realised loss can exceed `RISK_PER_TRADE`. `MAX_POSITION_PCT` is also a **per-position** cap measured against total equity — running several instances on different symbols can therefore take on more aggregate exposure than any single one of them can see.
 
 ---
 
@@ -183,7 +201,7 @@ sequenceDiagram
 | `main.py` | Polling fallback — 60 s REST loop with exponential backoff |
 | `execution.py` | Translates signals into orders, places stop-losses |
 | `strategy.py` | Evaluates indicators, applies EMA filter, returns `BUY / SELL / HOLD` |
-| `indicators.py` | RSI · EMA · MACD calculations via `pandas-ta` |
+| `indicators.py` | RSI · EMA · MACD · ATR, implemented on pandas/numpy |
 | `risk.py` | ATR stop distance · dynamic position sizing |
 | `data.py` | Fetches historical OHLCV bars via Alpaca REST |
 | `hybrid_data.py` | Alpaca WebSocket subscription → `DataBuffer` |
@@ -202,13 +220,18 @@ cd trading-bot
 
 ### 2. Install dependencies
 
-Requires **Python 3.12 or 3.13** — `pandas-ta` 0.4.x needs ≥ 3.12, and its pinned `numba` has no 3.14 build.
+Requires **Python 3.10+**. Dependencies are `alpaca-py`, `pandas`, `numpy` and `python-dotenv` — nothing heavier.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+> Indicators are implemented directly in `indicators.py` rather than via `pandas-ta`.
+> That library pulls in `numba` and `llvmlite`, which restricted the project to Python
+> 3.12–3.13 only (`pandas-ta` 0.4.x refuses < 3.12, and `numba` has no 3.14 build) —
+> a narrow interpreter window in exchange for four short, standard formulas.
 
 ### 3. Configure credentials
 
@@ -254,6 +277,27 @@ Both modes prompt for a ticker symbol at startup (e.g. `AAPL`, `TSLA`, `SPY`).
 
 ---
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+89 tests, no credentials and no network required — the Alpaca clients are built lazily,
+so every module imports and the order-routing logic runs against a fake client.
+
+| File | Covers |
+|---|---|
+| `test_indicators.py` | RSI · EMA · MACD · ATR against hand-derived values, including a cross-check of RSI against an independently written textbook Wilder implementation, and NaN-on-short-window behaviour |
+| `test_risk.py` | Which of the three sizing caps binds, and every refusal path (zero price, zero stop distance, account too small) |
+| `test_execution.py` | Position transitions, reversal sizing, GTC stops, and the stop re-assertion paths |
+| `test_strategy.py` | Signal rules per toggle combination, including regression cover for two rules that were unreachable |
+| `test_data.py` | The `normalise_bars` schema contract every other module relies on |
+| `test_offline_import.py` | That no module builds an Alpaca client at import — the invariant the rest of the suite depends on |
+
+---
+
 ## Configuration
 
 All settings are controlled via environment variables in `.env`:
@@ -289,14 +333,23 @@ trading-bot/
 ├── main.py                    # Polling entry point (fallback)
 ├── execution.py               # Order execution & stop-loss logic
 ├── strategy.py                # Signal evaluation (MACD + EMA filter)
-├── indicators.py              # RSI, EMA, MACD (pandas-ta)
+├── indicators.py              # RSI, EMA, MACD, ATR (pandas/numpy)
 ├── risk.py                    # Position sizing & ATR stop calculation
 ├── data.py                    # Historical bars (Alpaca REST)
 ├── data_buffer_methods.py     # Rolling bar buffer with prefill support
 ├── hybrid_data.py             # Real-time WebSocket bar subscription
+├── tests/                     # 89 tests — no credentials or network needed
+│   ├── conftest.py            #   OHLCV fixture in the normalise_bars shape
+│   ├── test_indicators.py
+│   ├── test_risk.py
+│   ├── test_execution.py      #   fake Alpaca client
+│   ├── test_strategy.py
+│   ├── test_data.py
+│   └── test_offline_import.py
 ├── .env.example               # Credentials & config template
 ├── .gitignore
-└── requirements.txt
+├── requirements.txt
+└── requirements-dev.txt       # requirements.txt + pytest
 ```
 
 ---

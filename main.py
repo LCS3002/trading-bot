@@ -8,11 +8,20 @@ import time
 
 from alpaca.trading.client import TradingClient
 
-import config  # noqa: F401 — initialises logging and validates credentials
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, PAPER_TRADING
+import config  # noqa: F401 — initialises logging
+from config import (
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY,
+    PAPER_TRADING,
+    require_credentials,
+)
 from execution import execution_instance
 
 logger = logging.getLogger(__name__)
+
+# Entry points validate credentials; importing config no longer does, so that the
+# pure signal and sizing logic stays importable (and testable) without keys.
+require_credentials()
 
 _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING)
 
